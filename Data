@@ -1,0 +1,127 @@
+"""Download all IR spectra available from NIST Chemistry Webbook."""
+import os
+import re
+import time
+import requests
+from bs4 import BeautifulSoup
+from multiprocessing.pool import ThreadPool
+import tqdm
+
+NIST_URL = 'https://webbook.nist.gov/cgi/cbook.cgi'
+EXACT_RE = re.compile('/cgi/cbook.cgi\?GetInChI=(.*?)$')
+ID_RE = re.compile('/cgi/cbook.cgi\?ID=(.*?)&')
+JDX_PATH = 'jdx'
+MOL_PATH = 'mol'
+BAD_PATH = 'bad_files'
+os.makedirs(JDX_PATH, exist_ok=True)
+os.makedirs(MOL_PATH, exist_ok=True)
+os.makedirs(BAD_PATH, exist_ok=True)
+bad_count = 0
+def safe_request(url, params, retries=5, wait=5):
+    global bad_count
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            txt = r.text.strip()
+            if "Rate limit exceeded" in txt:
+                time.sleep(10)
+                continue
+            return r
+        except Exception as e:
+            time.sleep(wait)
+    bad_count += 1
+    return None
+
+def search_nist_formula(formula, allow_other=True, allow_extra=False, match_isotopes=True, exclude_ions=False, has_ir=True):
+    """Search NIST using formula and return matching NIST IDs."""
+    try:
+        params = {'Formula': formula, 'Units': 'SI'}
+        if allow_other:
+            params['AllowOther'] = 'on'
+        if allow_extra:
+            params['AllowExtra'] = 'on'
+        if match_isotopes:
+            params['MatchIso'] = 'on'
+        if exclude_ions:
+            params['NoIon'] = 'on'
+        if has_ir:
+            params['cIR'] = 'on'
+        time.sleep(0.5)
+        response = safe_request(NIST_URL, params)
+        if not response:
+            return []
+        soup = BeautifulSoup(response.text, "html.parser")
+        ids = [re.match(ID_RE, link['href']).group(1) for link in soup('a', href=ID_RE)]
+        return ids
+    except Exception as e:
+        return []
+
+def save_file(content, filepath):
+    global bad_count
+    if not content or len(content) < 200:
+        bad_count += 1
+        badfile = os.path.join(BAD_PATH, os.path.basename(filepath))
+        with open(badfile, "wb") as f:
+            f.write(content)
+        return False
+    with open(filepath, "wb") as f:
+        f.write(content)
+    return True
+
+def get_jdx(nistid, stype="IR"):
+    """Download jdx file for the specified NIST ID."""
+    filepath = os.path.join(JDX_PATH, f'{nistid}-{stype}.jdx')
+    if os.path.isfile(filepath):
+        return
+    time.sleep(0.5)
+    r = safe_request(NIST_URL, {'JCAMP': nistid, 'Type': stype, 'Index': 0})
+    if not r:
+        return
+    if r.text.strip().startswith('##TITLE=Spectrum not found'):
+        return
+    if save_file(r.content, filepath):
+
+def get_mol(nistid):
+    """Download mol file for the specified NIST ID."""
+    filepath = os.path.join(MOL_PATH, f'{nistid}.mol')
+    if os.path.isfile(filepath):
+        return
+    time.sleep(0.5)
+    r = safe_request(NIST_URL, {'Str2File': nistid})
+    if not r:
+        return
+    if "M  END" not in r.text:
+        return
+    if save_file(r.content, filepath):
+
+def retreive_data_from_formula(formula):
+    ids = search_nist_formula(formula)
+    if not ids:
+        return
+    for nistid in ids:
+        get_mol(nistid)
+        get_jdx(nistid)
+
+def get_all_IR():
+    """Search NIST for all structures with IR spectra and download."""
+    formulae = []
+    IDs = []
+    with open("species.txt", encoding="utf-8") as data_file:
+        entries = data_file.readlines()
+        for entry in entries:
+            parts = entry.strip().split()
+            if len(parts) >= 2:
+                formulae.append(parts[-2])
+            else:
+                IDs.append(entry.strip())
+
+    with ThreadPool(3) as pool:  
+        list(tqdm.tqdm(pool.imap(retreive_data_from_formula, formulae), total=len(formulae)))
+
+    for nistid in IDs:
+        get_mol(nistid)
+        get_jdx(nistid)
+
+
+if __name__ == '__main__':
+    get_all_IR()
